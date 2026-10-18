@@ -118,9 +118,10 @@ jobs:
           Set-Content "$root\refused\.cloudpin.yml" "nosuchcloud:`n  account: x"
           Set-Content "$root\accepted\.cloudpin.yml" "azure:`n  subscription: 00000000-0000-0000-0000-000000000000"
 
-          # An unknown section is refused, never ignored, and the advice names Scoop's upgrade command.
+          # An unknown section is refused, never ignored, and the advice names Scoop's upgrade command. Each stderr
+          # record becomes its plain text, so no console-width wrapping splits the words matched below.
           Push-Location "$root\refused"
-          $out = & $cloudpin check 2>&1 | Out-String
+          $out = & $cloudpin check 2>&1 | ForEach-Object { "$_" } | Out-String
           $code = $LASTEXITCODE
           Pop-Location
           $out
@@ -133,7 +134,7 @@ jobs:
           Push-Location "$root\accepted"
           $saved = $env:Path
           $env:Path = "$env:SystemRoot\System32"
-          $out = & $cloudpin check 2>&1 | Out-String
+          $out = & $cloudpin check 2>&1 | ForEach-Object { "$_" } | Out-String
           $code = $LASTEXITCODE
           $env:Path = $saved
           Pop-Location
@@ -195,7 +196,7 @@ jobs:
           $bad = Join-Path $env:RUNNER_TEMP 'cloudpin-badhash.json'
           (Get-Content -Raw bucket\cloudpin.json).Replace("`"hash`": `"$env:REAL_HASH`"", "`"hash`": `"$zeros`"") | Set-Content -NoNewline $bad
           if (-not (Select-String -Quiet -SimpleMatch "`"hash`": `"$zeros`"" $bad)) { Fail 'the bad manifest still has the real hash' }
-          $out = scoop install --no-update-scoop $bad *>&1 | Out-String
+          $out = scoop install --no-update-scoop $bad *>&1 | ForEach-Object { "$_" } | Out-String
           $code = $LASTEXITCODE
           $out
           if ($code -eq 0) { Fail 'scoop install accepted a wrong hash' }
