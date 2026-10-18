@@ -1,0 +1,207 @@
+name: Test
+
+# One windows-latest job (the owner's CI budget: no matrix, no macOS runners) that installs Scoop and this
+# checkout's manifest the way a user would, then checks what got installed. Until bucket/cloudpin.json has a real
+# version (the 0.0.0 placeholder), it only checks the manifest's shape.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Scoop's installer at an exact commit, and its sha256 (both checked before it runs).
+  INSTALL_COMMIT: 1e2f334083d609986d8c8bc9e31ae8e87c39fab4
+  INSTALL_SHA256: 94f983b190438311e006b957db7c8422709e0ba62a6c2ac04e278164108f2512
+  # The installer clones Scoop's master; the job then checks out this commit (Scoop 0.6.0) so a new Scoop release
+  # can't change the result. The main bucket, which provides nodejs-lts, stays current, as it is for users.
+  SCOOP_COMMIT: e6aa3b366bdee8ed138c1e0f7b85192ebdd35d0f
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  manifest:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the manifest's shape
+        id: manifest
+        run: |
+          function Fail($msg) { Write-Host "::error::$msg"; exit 1 }
+          $file = 'bucket\cloudpin.json'
+          if (-not (Test-Path $file)) {
+            "No $file on this branch: nothing to check."
+            Add-Content $env:GITHUB_OUTPUT 'install=false'
+            exit 0
+          }
+          $m = Get-Content -Raw $file | ConvertFrom-Json
+          $v = $m.version
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { Fail "version is not x.y.z: $v" }
+          $url = "https://github.com/paureis/cloudpin/releases/download/v$v/cloudpin-$v-windows.zip"
+          if ($m.url -ne $url) { Fail "url is $($m.url), expected $url" }
+          if ($m.hash -cnotmatch '^[0-9a-f]{64}$') { Fail "hash is not 64 lowercase hex characters: $($m.hash)" }
+          if ($m.depends -ne 'nodejs-lts') { Fail "depends is $($m.depends), expected nodejs-lts" }
+          if ($null -ne $m.extract_dir) { Fail 'extract_dir is set; the zip has its files at the root' }
+          # The exe shim straight to Scoop's node: a .cmd or .ps1 bin would let cmd.exe or a second PowerShell
+          # re-read every argument (lib/core.ps1 `shim`).
+          $bin = @($m.bin)
+          $want = @('..\..\nodejs-lts\current\node.exe', 'cloudpin', '"$dir\dist\cli.js"')
+          if ($bin.Count -ne 1 -or @($bin[0]).Count -ne 3) { Fail 'bin must be one [target, name, args] entry' }
+          for ($i = 0; $i -lt 3; $i++) { if ($bin[0][$i] -cne $want[$i]) { Fail "bin[0][$i] is $($bin[0][$i]), expected $($want[$i])" } }
+          if ($m.checkver -ne 'github') { Fail 'checkver must be github' }
+          if ($m.autoupdate.url -cne 'https://github.com/paureis/cloudpin/releases/download/v$version/cloudpin-$version-windows.zip') { Fail 'autoupdate.url is wrong' }
+          if ($m.autoupdate.hash.url -cne '$baseurl/SHA256SUMS') { Fail 'autoupdate.hash.url must be $baseurl/SHA256SUMS' }
+          if ($v -eq '0.0.0') {
+            'The 0.0.0 placeholder: shape checked, nothing to install.'
+            Add-Content $env:GITHUB_OUTPUT 'install=false'
+          } else {
+            "Manifest for cloudpin $v looks right."
+            Add-Content $env:GITHUB_OUTPUT 'install=true'
+            Add-Content $env:GITHUB_OUTPUT "version=$v"
+            Add-Content $env:GITHUB_OUTPUT "hash=$($m.hash)"
+          }
+          exit 0
+
+      - name: Install Scoop
+        if: steps.manifest.outputs.install == 'true'
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'install.ps1'
+          Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/ScoopInstaller/Install/$env:INSTALL_COMMIT/install.ps1" -OutFile $installer
+          $got = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $env:INSTALL_SHA256) { Write-Host "::error::install.ps1 has sha256 $got, expected $env:INSTALL_SHA256"; exit 1 }
+          # Runners run as an administrator, which the installer refuses without -RunAsAdmin.
+          & $installer -RunAsAdmin
+          $core = "$env:USERPROFILE\scoop\apps\scoop\current"
+          git -C $core checkout -q $env:SCOOP_COMMIT
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not check out Scoop $env:SCOOP_COMMIT"; exit 1 }
+          Add-Content $env:GITHUB_PATH "$env:USERPROFILE\scoop\shims"
+
+      - name: Install cloudpin from this manifest
+        if: steps.manifest.outputs.install == 'true'
+        env:
+          VERSION: ${{ steps.manifest.outputs.version }}
+        run: |
+          # --no-update-scoop keeps the pinned Scoop.
+          scoop install --no-update-scoop (Resolve-Path bucket\cloudpin.json).Path
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::scoop install failed'; exit 1 }
+          $shims = "$env:USERPROFILE\scoop\shims"
+          foreach ($f in 'cloudpin.cmd', 'cloudpin.ps1', 'cloudpin') {
+            if (Test-Path "$shims\$f") { Write-Host "::error::Scoop made a $f shim; only cloudpin.exe is expected"; exit 1 }
+          }
+          Get-Content "$shims\cloudpin.shim"
+          $shim = Get-Content "$shims\cloudpin.shim" -Raw
+          if ($shim -notmatch [regex]::Escape('\apps\nodejs-lts\current\node.exe"')) { Write-Host '::error::the shim does not run nodejs-lts'; exit 1 }
+          $v = & "$shims\cloudpin.exe" --version
+          if ($v -ne $env:VERSION) { Write-Host "::error::cloudpin --version says $v, the manifest $env:VERSION"; exit 1 }
+          "cloudpin --version: $v"
+
+      - name: A pin cloudpin must refuse, and one it accepts
+        if: steps.manifest.outputs.install == 'true'
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Fail($msg) { Write-Host "::error::$msg"; exit 1 }
+          $cloudpin = "$env:USERPROFILE\scoop\shims\cloudpin.exe"
+          $root = Join-Path $env:RUNNER_TEMP 'pins'
+          New-Item -ItemType Directory -Force "$root\refused", "$root\accepted" | Out-Null
+          Set-Content "$root\refused\.cloudpin.yml" "nosuchcloud:`n  account: x"
+          Set-Content "$root\accepted\.cloudpin.yml" "azure:`n  subscription: 00000000-0000-0000-0000-000000000000"
+
+          # An unknown section is refused, never ignored, and the advice names Scoop's upgrade command.
+          Push-Location "$root\refused"
+          $out = & $cloudpin check 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Pop-Location
+          $out
+          if ($code -ne 1) { Fail "check exited $code on an unknown section, expected 1" }
+          if ($out -notmatch 'unknown section "nosuchcloud"') { Fail 'check did not name the unknown section' }
+          if ($out -notmatch 'scoop update cloudpin') { Fail 'the advice does not say scoop update cloudpin' }
+
+          # A valid pin passes when its CLI isn't installed. The runner image has az, so PATH holds only System32:
+          # the shim runs node by its full path and needs nothing else.
+          Push-Location "$root\accepted"
+          $saved = $env:Path
+          $env:Path = "$env:SystemRoot\System32"
+          $out = & $cloudpin check 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          $env:Path = $saved
+          Pop-Location
+          $out
+          if ($code -ne 0) { Fail "check exited $code on a valid pin with az absent, expected 0" }
+          if ($out -notmatch 'az is not installed here') { Fail 'check did not say az is not installed' }
+          exit 0
+
+      # Windows PowerShell 5.1, the shell the shell-init wrapper runs in for most Windows users. cloudpin explain
+      # --json prints the argv it received, so this sees exactly what reaches cloudpin.
+      - name: Arguments reach cloudpin unchanged
+        if: steps.manifest.outputs.install == 'true'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $shims = "$env:USERPROFILE\scoop\shims"
+          $want = @('gh', 'A', 'a&b', '%PATH%', '^', 'a|b', 'Z')
+          function Probe {
+            $out = (cloudpin explain --json -- gh A 'a&b' '%PATH%' '^' 'a|b' Z 2>$null | Out-String)
+            try { $got = @((ConvertFrom-Json -InputObject $out).calls[0].argv) } catch { $got = @() }
+            $same = $got.Count -eq $want.Count
+            if ($same) { for ($i = 0; $i -lt $want.Count; $i++) { if ($got[$i] -cne $want[$i]) { $same = $false } } }
+            "  got: $(ConvertTo-Json -Compress -InputObject $got)"
+            return $same
+          }
+          $saved = $env:Path
+          $env:Path = "$shims;$saved"
+          $source = (Get-Command cloudpin).Source
+          "cloudpin resolves to $source"
+          if ($source -ne "$shims\cloudpin.exe") { Write-Host "::error::cloudpin resolves to $source"; exit 1 }
+          $ok = Probe
+          if (-not ($ok[-1])) { $ok; Write-Host '::error::arguments changed on the way to cloudpin'; exit 1 }
+          $ok[0..($ok.Count - 2)]
+
+          # Control: the same probe through a .cmd launcher (what a .cmd bin would give) must see a change, or the
+          # check above could not fail.
+          $viaCmd = Join-Path $env:RUNNER_TEMP 'viacmd'
+          New-Item -ItemType Directory -Force $viaCmd | Out-Null
+          Set-Content -Encoding ascii "$viaCmd\cloudpin.cmd" "@`"$shims\cloudpin.exe`" %*"
+          $env:Path = "$viaCmd;$saved"
+          "control: cloudpin resolves to $((Get-Command cloudpin).Source)"
+          $ok = Probe
+          $env:Path = $saved
+          $ok[0..($ok.Count - 2)]
+          if ($ok[-1]) { Write-Host '::error::the probe saw no change through a .cmd launcher, so it proves nothing'; exit 1 }
+          'Through the exe shim the arguments arrive unchanged; through a .cmd launcher they do not.'
+          exit 0
+
+      # Control: everything above proves nothing unless a wrong hash is refused.
+      - name: A wrong hash must fail the install
+        if: steps.manifest.outputs.install == 'true'
+        env:
+          REAL_HASH: ${{ steps.manifest.outputs.hash }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Fail($msg) { Write-Host "::error::$msg"; exit 1 }
+          $zeros = '0' * 64
+          # Another app name, so Scoop downloads again instead of reporting cloudpin as installed.
+          $bad = Join-Path $env:RUNNER_TEMP 'cloudpin-badhash.json'
+          (Get-Content -Raw bucket\cloudpin.json).Replace("`"hash`": `"$env:REAL_HASH`"", "`"hash`": `"$zeros`"") | Set-Content -NoNewline $bad
+          if (-not (Select-String -Quiet -SimpleMatch "`"hash`": `"$zeros`"" $bad)) { Fail 'the bad manifest still has the real hash' }
+          $out = scoop install --no-update-scoop $bad *>&1 | Out-String
+          $code = $LASTEXITCODE
+          $out
+          if ($code -eq 0) { Fail 'scoop install accepted a wrong hash' }
+          # Failing for another reason (say, the network) would prove nothing: the zip must have been downloaded and
+          # hashed to the real value (wording as Scoop 0.6.0, lib/download.ps1).
+          if ($out -notmatch 'Hash check failed') { Fail 'scoop install failed, but not on the hash' }
+          if ($out -notmatch "Actual:\s+$env:REAL_HASH") { Fail 'Scoop did not report the real hash as the actual one' }
+          'scoop install refused the wrong hash, as it should'
+          exit 0
