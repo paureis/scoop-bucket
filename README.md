@@ -5,7 +5,7 @@ repo, and stop any command (yours or your AI agent's) that would run on the wron
 
 ## Install
 
-On Windows, from cloudpin 1.2.0 (released 2026-11-05):
+On Windows, from cloudpin 1.2.0 (due 2026-11-05):
 
 ```powershell
 scoop bucket add paureis https://github.com/paureis/scoop-bucket
