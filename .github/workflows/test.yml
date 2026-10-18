@@ -2,17 +2,26 @@ name: Test
 
 # One windows-latest job (the owner's CI budget: no matrix, no macOS runners) that installs Scoop and this
 # checkout's manifest the way a user would, then checks what got installed. Until bucket/cloudpin.json has a real
-# version (the 0.0.0 placeholder), it only checks the manifest's shape.
+# version (the 0.0.0 placeholder), a push or pull request only checks the manifest's shape. Run by hand
+# (workflow_dispatch), it also builds the Windows zip from paureis/cloudpin at `cloudpin_ref` and runs every install
+# check against a test manifest for that zip, so they run before a release instead of on release day.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      cloudpin_ref:
+        description: Branch, tag or commit SHA of paureis/cloudpin to build the zip from
+        type: string
+        required: true
+        default: main
 
 permissions:
   contents: read
 
 concurrency:
-  group: test-${{ github.event.pull_request.number || github.ref }}
+  group: test-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -69,13 +78,101 @@ jobs:
           } else {
             "Manifest for cloudpin $v looks right."
             Add-Content $env:GITHUB_OUTPUT 'install=true'
+            Add-Content $env:GITHUB_OUTPUT "manifest=$((Resolve-Path $file).Path)"
             Add-Content $env:GITHUB_OUTPUT "version=$v"
             Add-Content $env:GITHUB_OUTPUT "hash=$($m.hash)"
           }
           exit 0
 
+      # Run by hand only: the zip from paureis/cloudpin at cloudpin_ref, built as release.yml builds it.
+      - name: Check out paureis/cloudpin
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: paureis/cloudpin
+          ref: ${{ inputs.cloudpin_ref }}
+          path: cloudpin-src
+          persist-credentials: false
+
+      - name: Set up Node.js
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.21.0
+
+      - name: Build the zip and a test manifest for it
+        id: testzip
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: cloudpin-src
+        run: |
+          function Fail($msg) { Write-Host "::error::$msg"; exit 1 }
+          npm ci
+          if ($LASTEXITCODE -ne 0) { Fail 'npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { Fail 'npm run build failed' }
+          $out = Join-Path $env:RUNNER_TEMP 'testzip'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $tgz = npm pack --silent --pack-destination $out
+          if ($LASTEXITCODE -ne 0) { Fail 'npm pack failed' }
+          node scripts/windows-zip.mjs (Join-Path $out $tgz) $out
+          if ($LASTEXITCODE -ne 0) { Fail 'windows-zip.mjs failed' }
+          $v = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $zip = Join-Path $out "cloudpin-$v-windows.zip"
+          if (-not (Test-Path $zip)) { Fail "no $zip" }
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          # Scoop downloads with [Net.WebRequest]::Create (lib/download.ps1 Invoke-Download at SCOOP_COMMIT), which
+          # reads file:// URLs too, so the zip needs no server. depends and bin are the ones the shape check requires.
+          $url = ([System.Uri]$zip).AbsoluteUri
+          $bucket = Join-Path $env:RUNNER_TEMP 'testbucket'
+          New-Item -ItemType Directory -Force $bucket | Out-Null
+          $manifest = Join-Path $bucket 'cloudpin.json'
+          $template = @'
+          {
+              "version": "@VERSION@",
+              "depends": "nodejs-lts",
+              "url": "@URL@",
+              "hash": "@HASH@",
+              "bin": [["..\\..\\nodejs-lts\\current\\node.exe", "cloudpin", "\"$dir\\dist\\cli.js\""]]
+          }
+          '@
+          $template.Replace('@VERSION@', $v).Replace('@URL@', $url).Replace('@HASH@', $hash) | Set-Content -NoNewline $manifest
+          Get-Content $manifest
+          $m = Get-Content -Raw $manifest | ConvertFrom-Json
+          if ($m.version -ne $v -or $m.hash -ne $hash -or @($m.bin[0]).Count -ne 3) { Fail 'the test manifest did not come out as written' }
+          Add-Content $env:GITHUB_OUTPUT "manifest=$manifest"
+          Add-Content $env:GITHUB_OUTPUT "version=$v"
+          Add-Content $env:GITHUB_OUTPUT "hash=$hash"
+
+      # The manifest every step below installs: the test one when run by hand, else this checkout's (if not 0.0.0).
+      - name: Choose the manifest to install
+        id: target
+        env:
+          DISPATCHED: ${{ github.event_name == 'workflow_dispatch' }}
+          TEST_MANIFEST: ${{ steps.testzip.outputs.manifest }}
+          TEST_VERSION: ${{ steps.testzip.outputs.version }}
+          TEST_HASH: ${{ steps.testzip.outputs.hash }}
+          REAL_INSTALL: ${{ steps.manifest.outputs.install }}
+          REAL_MANIFEST: ${{ steps.manifest.outputs.manifest }}
+          REAL_VERSION: ${{ steps.manifest.outputs.version }}
+          REAL_HASH: ${{ steps.manifest.outputs.hash }}
+        run: |
+          if ($env:DISPATCHED -eq 'true') {
+            $m, $v, $h = $env:TEST_MANIFEST, $env:TEST_VERSION, $env:TEST_HASH
+          } elseif ($env:REAL_INSTALL -eq 'true') {
+            $m, $v, $h = $env:REAL_MANIFEST, $env:REAL_VERSION, $env:REAL_HASH
+          } else {
+            'Nothing to install.'
+            Add-Content $env:GITHUB_OUTPUT 'install=false'
+            exit 0
+          }
+          "Installing $m (cloudpin $v)"
+          Add-Content $env:GITHUB_OUTPUT 'install=true'
+          Add-Content $env:GITHUB_OUTPUT "manifest=$m"
+          Add-Content $env:GITHUB_OUTPUT "version=$v"
+          Add-Content $env:GITHUB_OUTPUT "hash=$h"
+
       - name: Install Scoop
-        if: steps.manifest.outputs.install == 'true'
+        if: steps.target.outputs.install == 'true'
         run: |
           $installer = Join-Path $env:RUNNER_TEMP 'install.ps1'
           Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/ScoopInstaller/Install/$env:INSTALL_COMMIT/install.ps1" -OutFile $installer
@@ -88,13 +185,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not check out Scoop $env:SCOOP_COMMIT"; exit 1 }
           Add-Content $env:GITHUB_PATH "$env:USERPROFILE\scoop\shims"
 
-      - name: Install cloudpin from this manifest
-        if: steps.manifest.outputs.install == 'true'
+      - name: Install cloudpin from the manifest
+        if: steps.target.outputs.install == 'true'
         env:
-          VERSION: ${{ steps.manifest.outputs.version }}
+          MANIFEST: ${{ steps.target.outputs.manifest }}
+          VERSION: ${{ steps.target.outputs.version }}
         run: |
           # --no-update-scoop keeps the pinned Scoop.
-          scoop install --no-update-scoop (Resolve-Path bucket\cloudpin.json).Path
+          scoop install --no-update-scoop $env:MANIFEST
           if ($LASTEXITCODE -ne 0) { Write-Host '::error::scoop install failed'; exit 1 }
           $shims = "$env:USERPROFILE\scoop\shims"
           foreach ($f in 'cloudpin.cmd', 'cloudpin.ps1', 'cloudpin') {
@@ -108,7 +206,7 @@ jobs:
           "cloudpin --version: $v"
 
       - name: A pin cloudpin must refuse, and one it accepts
-        if: steps.manifest.outputs.install == 'true'
+        if: steps.target.outputs.install == 'true'
         run: |
           $ErrorActionPreference = 'Continue'
           function Fail($msg) { Write-Host "::error::$msg"; exit 1 }
@@ -146,7 +244,7 @@ jobs:
       # Windows PowerShell 5.1, the shell the shell-init wrapper runs in for most Windows users. cloudpin explain
       # --json prints the argv it received, so this sees exactly what reaches cloudpin.
       - name: Arguments reach cloudpin unchanged
-        if: steps.manifest.outputs.install == 'true'
+        if: steps.target.outputs.install == 'true'
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
@@ -185,16 +283,17 @@ jobs:
 
       # Control: everything above proves nothing unless a wrong hash is refused.
       - name: A wrong hash must fail the install
-        if: steps.manifest.outputs.install == 'true'
+        if: steps.target.outputs.install == 'true'
         env:
-          REAL_HASH: ${{ steps.manifest.outputs.hash }}
+          MANIFEST: ${{ steps.target.outputs.manifest }}
+          REAL_HASH: ${{ steps.target.outputs.hash }}
         run: |
           $ErrorActionPreference = 'Continue'
           function Fail($msg) { Write-Host "::error::$msg"; exit 1 }
           $zeros = '0' * 64
           # Another app name, so Scoop downloads again instead of reporting cloudpin as installed.
           $bad = Join-Path $env:RUNNER_TEMP 'cloudpin-badhash.json'
-          (Get-Content -Raw bucket\cloudpin.json).Replace("`"hash`": `"$env:REAL_HASH`"", "`"hash`": `"$zeros`"") | Set-Content -NoNewline $bad
+          (Get-Content -Raw $env:MANIFEST).Replace("`"hash`": `"$env:REAL_HASH`"", "`"hash`": `"$zeros`"") | Set-Content -NoNewline $bad
           if (-not (Select-String -Quiet -SimpleMatch "`"hash`": `"$zeros`"" $bad)) { Fail 'the bad manifest still has the real hash' }
           $out = scoop install --no-update-scoop $bad *>&1 | ForEach-Object { "$_" } | Out-String
           $code = $LASTEXITCODE
