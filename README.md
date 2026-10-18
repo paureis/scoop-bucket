@@ -17,6 +17,12 @@ bucket), which Scoop installs if it isn't there yet, and it always uses that one
 the nodejs.org installer) is on PATH. A global install (`scoop install -g paureis/cloudpin`) needs `nodejs-lts`
 installed globally too: Scoop adds it as a global dependency, and a per-user `nodejs-lts` doesn't count.
 
+`nodejs-lts` also puts its folders at the front of your user PATH (its manifest's `env_add_path`), so in new shells
+`node` and `npm` are Scoop's (and `npm install --global` installs there), ahead of any other Node.js on your user
+PATH; one on the system PATH, where the nodejs.org installer puts it, still comes first. Uninstalling `nodejs-lts`
+breaks cloudpin until you run `scoop install nodejs-lts` again. Scoop's `no_junction` setting isn't supported: the
+`cloudpin` shim runs `nodejs-lts\current\node.exe`, and without junctions there is no `current` folder.
+
 Switching from npm? Run `npm uninstall --global cloudpin` first, so the old copy doesn't keep running from earlier on
 PATH.
 
