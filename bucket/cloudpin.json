@@ -1,11 +1,11 @@
 {
-    "version": "1.2.2",
+    "version": "1.2.3",
     "description": "Pin cloud CLI accounts to a repo and block commands, yours or your AI agent's, on the wrong one",
     "homepage": "https://github.com/paureis/cloudpin",
     "license": "MIT",
     "depends": "nodejs-lts",
-    "url": "https://github.com/paureis/cloudpin/releases/download/v1.2.2/cloudpin-1.2.2-windows.zip",
-    "hash": "ff20ef16fcd1ac7c1dd1fa480647157b454b3f205f5864cff29be8edc6f983a7",
+    "url": "https://github.com/paureis/cloudpin/releases/download/v1.2.3/cloudpin-1.2.3-windows.zip",
+    "hash": "6d0b414992de84edfcab2b5f8d176aa223863cf5244b8192b1c9aefbd88a499f",
     "bin": [
         [
             "..\\..\\nodejs-lts\\current\\node.exe",
